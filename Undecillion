@@ -61,7 +61,7 @@ symbols = ["USDJPY"]
 lot_step = 0.01
 
 slippage = 3
-magic_number = 20250708  # Unique identifier for the Undecillion engine
+magic_number = 20257008  # Unique identifier for the Undecillion engine
 timezone_offset = -5  # Jamaica timezone is UTC-5
 
 session_times = {
@@ -1400,7 +1400,7 @@ def trading_loop():
                         tp,
                         volume,
                         slippage=50,
-                        magic_number=20250708
+                        magic_number=20257008
                     )
 
                     if result is None:
