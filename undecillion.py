@@ -1278,55 +1278,78 @@ def trading_loop():
     global processed_signals, traded_signals, startup_complete
 
     symbols = ["USDJPY"]
-    poll_interval = 0.1  # seconds
+    poll_interval = 0.2  # seconds
 
     logging.info("Starting fully-logged execution loop")
 
-    # --- GLOBAL PAUSE STATE ---
+    # =============================
+    # GLOBAL PAUSE STATE
+    # =============================
     execution_paused = False
-    MAX_CONSECUTIVE_LOSSES = 2  # pause after 2 consecutive losses
+    MAX_CONSECUTIVE_LOSSES = 1  # set to 2 if you want two losses
 
     def check_pause():
-        """Determine if execution should be paused or resumed."""
         nonlocal execution_paused
-        # Get last MAX_CONSECUTIVE_LOSSES closed outcomes
-        recent_outcomes = [sig["outcome"] for sig in reversed(processed_signals) if sig["outcome"] in ("win", "loss")]
-        last_losses = recent_outcomes[:MAX_CONSECUTIVE_LOSSES]
 
-        if execution_paused:
-            # Resume only if a win is logged after the pause
-            for outcome in last_losses:
-                if outcome == "win":
-                    execution_paused = False
-                    logging.info("Execution resumed ✅")
-                    return
-            # still paused
+        # Only look at CLOSED outcomes
+        closed = [
+            sig["outcome"]
+            for sig in reversed(processed_signals)
+            if sig.get("outcome") in ("win", "loss")
+        ]
+
+        if not closed:
             return
 
-        # Not paused yet: pause if last N outcomes are losses
-        if len(last_losses) == MAX_CONSECUTIVE_LOSSES and all(o == "loss" for o in last_losses):
-            execution_paused = True
-            logging.info(f"Execution paused due to {MAX_CONSECUTIVE_LOSSES} consecutive losses ❌")
+        recent = closed[:MAX_CONSECUTIVE_LOSSES]
 
+        # --- RESUME CONDITION ---
+        if execution_paused:
+            if recent and recent[0] == "win":
+                execution_paused = False
+                logging.info("Execution resumed ✅")
+            return
+
+        # --- PAUSE CONDITION ---
+        if (
+            len(recent) == MAX_CONSECUTIVE_LOSSES
+            and all(o == "loss" for o in recent)
+        ):
+            execution_paused = True
+            logging.info(
+                f"Execution paused due to {MAX_CONSECUTIVE_LOSSES} consecutive losses ❌"
+            )
+
+    # =============================
+    # MAIN LOOP
+    # =============================
     while True:
         try:
             for symbol in symbols:
-                # --- SYMBOL CHECK ---
+
+                # =============================
+                # SYMBOL CHECK
+                # =============================
                 info = mt5.symbol_info(symbol)
                 if not info:
                     logging.error(f"{symbol} symbol_info None")
                     continue
+
                 if not info.visible:
                     mt5.symbol_select(symbol, True)
 
-                df = fetch_data("USDJPY", csv_path="USDJPY_M15.csv")
+                # =============================
+                # FETCH DATA
+                # =============================
+                df = fetch_data(symbol, csv_path="USDJPY_M15.csv")
                 if df is None or len(df) < 3:
                     continue
 
-                # --- DROP FORMING CANDLE ---
                 df = df.iloc[:-1].copy()
 
-                # --- RUN SIGNAL PIPELINE ---
+                # =============================
+                # SIGNAL PIPELINE (UNCHANGED)
+                # =============================
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
                 df = apply_liquidity_filter(df)
@@ -1342,10 +1365,15 @@ def trading_loop():
                 accepted = df[df["signal_accepted"] == True].copy()
                 logging.info(f"{symbol} accepted signals count: {len(accepted)}")
 
-                # --- STARTUP SYNC ---
+                # =============================
+                # STARTUP SYNC
+                # =============================
                 if not startup_complete:
                     for _, row in accepted.iterrows():
                         sig_id = (symbol, row["time"], row.get("direction"))
+                        if sig_id in traded_signals:
+                            continue
+
                         traded_signals.add(sig_id)
                         processed_signals.append({
                             "symbol": symbol,
@@ -1358,20 +1386,24 @@ def trading_loop():
                             "outcome": None,
                             "pattern_id": row.get("pattern_id")
                         })
+
                     startup_complete = True
                     logging.info(f"{symbol} startup sync complete")
                     continue
 
-                # --- NORMAL OPERATION ---
-                check_pause()  # check pause/resume before attempting trades
+                # =============================
+                # CHECK PAUSE STATE
+                # =============================
+                check_pause()
 
+                # =============================
+                # PROCESS SIGNALS
+                # =============================
                 for _, row in accepted.iterrows():
+
                     sig_id = (symbol, row["time"], row.get("direction"))
 
-                    if execution_paused:
-                        logging.info(f"Execution paused; skipping trade at {row['time']}")
-                        continue
-
+                    # Prevent duplicate signal logging
                     if sig_id in traded_signals:
                         continue
 
@@ -1381,15 +1413,44 @@ def trading_loop():
                     direction = row.get("direction")
                     pid = row.get("pattern_id")
 
+                    # ----------------------------------
+                    # ALWAYS LOG SIGNAL (CRITICAL FIX)
+                    # ----------------------------------
+                    processed_signals.append({
+                        "symbol": symbol,
+                        "time": row["time"],
+                        "direction": direction,
+                        "entry": entry,
+                        "sl": sl,
+                        "tp": tp,
+                        "candle_index": row.name,
+                        "outcome": None,
+                        "pattern_id": pid
+                    })
+
+                    traded_signals.add(sig_id)
+
+                    # ----------------------------------
+                    # EXECUTION LAYER ONLY
+                    # ----------------------------------
+                    if execution_paused:
+                        logging.info(
+                            f"Execution paused; signal logged but trade skipped at {row['time']}"
+                        )
+                        continue
+
                     try:
-                        volume = calculate_volume(entry, sl, symbol, risk_pct=0.10)
+                        volume = calculate_volume(
+                            entry, sl, symbol, risk_pct=0.10
+                        )
                     except Exception as e:
                         volume = 0.01
                         logging.error(f"Volume calculation failed: {e}")
 
                     logging.info(
-                        f"ATTEMPTING TRADE | Symbol={symbol} Direction={direction} "
-                        f"Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
+                        f"ATTEMPTING TRADE | Symbol={symbol} "
+                        f"Direction={direction} Entry={entry} "
+                        f"SL={sl} TP={tp} Vol={volume} Pattern={pid}"
                     )
 
                     result = place_trade(
@@ -1403,52 +1464,37 @@ def trading_loop():
                         magic_number=20257008
                     )
 
-                    if result is None:
-                        logging.error("MT5 TRADE RESULT IS NONE")
-                        continue
-
-                    logging.info(
-                        f"MT5 TRADE RESULT | retcode={result.retcode} | "
-                        f"Symbol={symbol} Direction={direction} Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
-                    )
-
-                    if result.retcode == mt5.TRADE_RETCODE_DONE:
-                        traded_signals.add(sig_id)
+                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                         logging.info("TRADE FIRED ✅")
                     else:
                         logging.warning("TRADE FAILED ❌")
 
-                    processed_signals.append({
-                        "symbol": symbol,
-                        "time": row["time"],
-                        "direction": direction,
-                        "entry": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "candle_index": row.name,
-                        "outcome": None,
-                        "pattern_id": pid
-                    })
-
-                # --- EVALUATE WIN/LOSS ---
+                # =============================
+                # EVALUATE OUTCOMES
+                # =============================
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
-                # --- LOG WIN-LOSS SEQUENCE AND WIN RATE ---
+                # =============================
+                # LOG STATS
+                # =============================
                 print_win_loss_sequence(processed_signals, last_n=5000)
                 update_win_rate()
 
-                # --- ANALYZE LOSING TRADE ATTRIBUTES ---
                 signals_df = pd.DataFrame(processed_signals)
                 if "pattern_id" not in signals_df.columns:
                     signals_df["pattern_id"] = signals_df.index
-                analyze_losing_trade_attributes(df, signals_df, min_trades=50)
+
+                analyze_losing_trade_attributes(
+                    df, signals_df, min_trades=50
+                )
 
         except Exception as e:
             logging.error(f"LOOP ERROR: {e}")
             logging.error(traceback.format_exc())
 
         time.sleep(poll_interval)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
