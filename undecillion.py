@@ -1282,54 +1282,52 @@ def trading_loop():
 
     logging.info("Starting fully-logged execution loop")
 
-    # =============================
-    # GLOBAL PAUSE STATE
-    # =============================
     execution_paused = False
-    MAX_CONSECUTIVE_LOSSES = 1  # set to 2 if you want two losses
+    MAX_CONSECUTIVE_LOSSES = 1
 
     def check_pause():
         nonlocal execution_paused
 
-        # Only look at CLOSED outcomes
         closed = [
-            sig["outcome"]
-            for sig in reversed(processed_signals)
+            sig for sig in processed_signals
             if sig.get("outcome") in ("win", "loss")
         ]
 
         if not closed:
             return
 
-        recent = closed[:MAX_CONSECUTIVE_LOSSES]
+        closed_sorted = sorted(
+            closed,
+            key=lambda x: x["time"],
+            reverse=True
+        )
 
-        # --- RESUME CONDITION ---
+        recent = closed_sorted[:MAX_CONSECUTIVE_LOSSES]
+
+        if not recent:
+            return
+
+        # RESUME
         if execution_paused:
-            if recent and recent[0] == "win":
+            if recent[0]["outcome"] == "win":
                 execution_paused = False
                 logging.info("Execution resumed ✅")
             return
 
-        # --- PAUSE CONDITION ---
+        # PAUSE
         if (
             len(recent) == MAX_CONSECUTIVE_LOSSES
-            and all(o == "loss" for o in recent)
+            and all(sig["outcome"] == "loss" for sig in recent)
         ):
             execution_paused = True
             logging.info(
                 f"Execution paused due to {MAX_CONSECUTIVE_LOSSES} consecutive losses ❌"
             )
 
-    # =============================
-    # MAIN LOOP
-    # =============================
     while True:
         try:
             for symbol in symbols:
 
-                # =============================
-                # SYMBOL CHECK
-                # =============================
                 info = mt5.symbol_info(symbol)
                 if not info:
                     logging.error(f"{symbol} symbol_info None")
@@ -1338,18 +1336,12 @@ def trading_loop():
                 if not info.visible:
                     mt5.symbol_select(symbol, True)
 
-                # =============================
-                # FETCH DATA
-                # =============================
                 df = fetch_data(symbol, csv_path="USDJPY_M15.csv")
                 if df is None or len(df) < 3:
                     continue
 
                 df = df.iloc[:-1].copy()
 
-                # =============================
-                # SIGNAL PIPELINE (UNCHANGED)
-                # =============================
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
                 df = apply_liquidity_filter(df)
@@ -1391,19 +1383,23 @@ def trading_loop():
                     logging.info(f"{symbol} startup sync complete")
                     continue
 
-                # =============================
-                # CHECK PAUSE STATE
-                # =============================
+                # =====================================
+                # ✅ EVALUATE OUTCOMES FIRST (FIXED)
+                # =====================================
+                for sig in processed_signals:
+                    check_signal_outcome(df, sig)
+
+                # =====================================
+                # ✅ NOW CHECK PAUSE STATE
+                # =====================================
                 check_pause()
 
-                # =============================
+                # =====================================
                 # PROCESS SIGNALS
-                # =============================
+                # =====================================
                 for _, row in accepted.iterrows():
-
                     sig_id = (symbol, row["time"], row.get("direction"))
 
-                    # Prevent duplicate signal logging
                     if sig_id in traded_signals:
                         continue
 
@@ -1413,9 +1409,6 @@ def trading_loop():
                     direction = row.get("direction")
                     pid = row.get("pattern_id")
 
-                    # ----------------------------------
-                    # ALWAYS LOG SIGNAL (CRITICAL FIX)
-                    # ----------------------------------
                     processed_signals.append({
                         "symbol": symbol,
                         "time": row["time"],
@@ -1430,9 +1423,16 @@ def trading_loop():
 
                     traded_signals.add(sig_id)
 
-                    # ----------------------------------
-                    # EXECUTION LAYER ONLY
-                    # ----------------------------------
+                    positions = mt5.positions_get()
+                    open_positions = len(positions) if positions else 0
+
+                    if open_positions >= 3:
+                        logging.info(
+                            f"MT5 ACCOUNT LIMIT REACHED ({open_positions}) — "
+                            f"Signal logged but trade blocked at {row['time']}"
+                        )
+                        continue
+
                     if execution_paused:
                         logging.info(
                             f"Execution paused; signal logged but trade skipped at {row['time']}"
@@ -1441,7 +1441,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.10
+                            entry, sl, symbol, risk_pct=0.05
                         )
                     except Exception as e:
                         volume = 0.01
@@ -1456,12 +1456,12 @@ def trading_loop():
                     result = place_trade(
                         symbol,
                         direction,
-                        sl,
                         entry,
+                        sl,
                         tp,
                         volume,
                         slippage=50,
-                        magic_number=20257008
+                        magic_number=45650708
                     )
 
                     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -1469,15 +1469,9 @@ def trading_loop():
                     else:
                         logging.warning("TRADE FAILED ❌")
 
-                # =============================
-                # EVALUATE OUTCOMES
-                # =============================
-                for sig in processed_signals:
-                    check_signal_outcome(df, sig)
-
-                # =============================
-                # LOG STATS
-                # =============================
+                # =====================================
+                # LOG STATS (after stable state)
+                # =====================================
                 print_win_loss_sequence(processed_signals, last_n=5000)
                 update_win_rate()
 
